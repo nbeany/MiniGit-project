@@ -31,6 +31,24 @@ bool directoryExists(const char* path) {
     return (info.st_mode & S_IFDIR) != 0;
 }
 
+void saveHEAD(const std::string& commitId) {
+    std::ofstream out(".minigit/HEAD");
+    if (out) {
+        out << commitId;
+    } else {
+        std::cerr << "Error writing HEAD\n";
+    }
+}
+
+std::string loadHEAD() {
+    std::ifstream in(".minigit/HEAD");
+    std::string id;
+    if (in) {
+        std::getline(in, id);
+    }
+    return id;
+}
+
 void initializeMiniGit() {
     if (!directoryExists(".minigit")) {
         system("mkdir .minigit");
@@ -38,6 +56,7 @@ void initializeMiniGit() {
     } else {
         std::cout << ".minigit folder already exists\n";
     }
+    lastCommitId = loadHEAD();  // load latest commit ID from HEAD file
 }
 
 void createFolders() {
@@ -153,6 +172,7 @@ void commit() {
 
     saveCommitMetadata(newCommit);
     lastCommitId = newCommit.id;
+    saveHEAD(newCommit.id);  // update HEAD with latest commit
 }
 
 // ---------------------- Main Program ----------------------
