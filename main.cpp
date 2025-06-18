@@ -174,28 +174,105 @@ void commit() {
     lastCommitId = newCommit.id;
     saveHEAD(newCommit.id);  // update HEAD with latest commit
 }
+// --- addSingleFile -------------------------------------------------
+void addSingleFile(const std::string& name)
+{
+    for (const auto& f : stagedFiles)
+        if (f.fileName == name) {
+            std::cout << "Already staged.\n";
+            return;
+        }
+    stagedFiles.push_back({name, 0});
+    std::cout << "Staged " << name << "\n";
+}
+
+// --- commit (overload takes message) -------------------------------
+void commit(const std::string& message)
+{
+    createFolders();
+
+    Commit newCommit;
+    newCommit.id        = generateCommitId();
+    newCommit.timestamp = getCurrentTimestamp();
+    newCommit.parentId  = lastCommitId;
+    newCommit.message   = message;
+
+    for (auto& f : stagedFiles) {
+        std::string versionedName = f.fileName + "_" + std::to_string(f.versionCount);
+        std::string dest = ".minigit/objects/" + versionedName;
+
+        if (copyFile(f.fileName, dest)) {
+            newCommit.files.push_back({f.fileName, f.versionCount});
+            f.versionCount++;
+        }
+    }
+
+    saveCommitMetadata(newCommit);
+    lastCommitId = newCommit.id;
+    saveHEAD(newCommit.id);
+    std::cout << "Committed as " << newCommit.id << "\n";
+}
+
+// --- logHistory ----------------------------------------------------
+void logHistory()
+{
+    std::string id = loadHEAD();
+    if (id.empty()) { std::cout << "No commits yet.\n"; return; }
+
+    while (!id.empty()) {
+        std::ifstream in(".minigit/commits/" + id + ".txt");
+        if (!in) { std::cerr << "Missing commit file for " << id << "\n"; break; }
+
+        std::string line;
+        std::string parent;
+        while (std::getline(in, line)) {
+            std::cout << line << '\n';
+            if (line.rfind("Parent ID:", 0) == 0)
+                parent = line.substr(11);          // crude parse
+        }
+        std::cout << "--------------------------\n";
+        id = (parent == "" || parent == " ") ? "" : parent;
+    }
+}
 
 // ---------------------- Main Program ----------------------
 
-int main() {
-    initializeMiniGit();
-    addFile();
-
-    std::cout << "\nFiles staged for tracking:\n";
-    for (const auto& f : stagedFiles) {
-        std::cout << "- " << f.fileName << " (current version count: " << f.versionCount << ")\n";
+int main(int argc, char* argv[])
+{
+    if (argc < 2) {
+        std::cout << "MiniGit commands: init | add <file> | commit -m \"msg\" | log\n";
+        return 0;
     }
 
-    char answer;
-    do {
-        std::cout << "\nCommitting files...\n";
-        commit();
+    std::string cmd = argv[1];
 
-        std::cout << "\nCommit again? (y/n): ";
-        std::cin >> answer;
-        std::cin.ignore();  // clear newline
-    } while (answer == 'y' || answer == 'Y');
+    if (cmd == "init") {
+        initializeMiniGit();
+        std::cout << "Repository initialised.\n";
+        return 0;
+    }
 
-    std::cout << "Exiting MiniGit.\n";
+    // Every command below expects .minigit to exist
+    initializeMiniGit();
+
+    if (cmd == "add") {
+        if (argc < 3) { std::cerr << "add <filename>\n"; return 1; }
+        addSingleFile(argv[2]);            // new helper, see next block
+    }
+    else if (cmd == "commit") {
+        if (argc >= 4 && std::string(argv[2]) == "-m") {
+            commit(argv[3]);               // commit now takes message as param
+        } else {
+            std::cerr << "commit -m \"message\"\n"; return 1;
+        }
+    }
+    else if (cmd == "log") {
+        logHistory();                      // brand‑new function, coming up
+    }
+    else {
+        std::cerr << "Unknown command.\n";
+        return 1;
+    }
     return 0;
 }
+
