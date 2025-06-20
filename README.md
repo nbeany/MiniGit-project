@@ -23,7 +23,7 @@ Follow these steps to clone the repository and set up the project:
 
 Clone the Repository:
 
-Open a terminal and run:git clone https://github.com/bethe1996/MiniGit-project.git
+Open a terminal and run:git clone https://github.com/nbeany/MiniGit-project.git
 cd MiniGit-project
 
 
