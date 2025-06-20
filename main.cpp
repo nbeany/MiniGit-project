@@ -1,351 +1,276 @@
 #include <iostream>
-#include <fstream>
-#include <sstream>
-#include <string>
 #include <vector>
-#include <map>
-#include <set>
-#include <algorithm>
-#include <filesystem>
+#include <string>
+#include <fstream>
+#include <cstdlib>
 #include <ctime>
-#include <iomanip>
+#include <sstream>
+#include <sys/stat.h>
 
-namespace fs = std::filesystem;
-
-struct Commit {
-    std::vector<std::string> parents;
-    std::string timestamp;
-    std::string message;
-    std::map<std::string, std::string> files; // filename to blob_hash
+struct FileNode {
+    std::string fileName;
+    int versionCount;  // track current version number
 };
 
-unsigned long custom_hash(const std::string& str) {
-    unsigned long hash = 5381;
-    for (char c : str) {
-        hash = ((hash << 5) + hash) + c; // hash * 33 + c
-    }
-    return hash;
+struct Commit {
+    std::string id;
+    std::string message;
+    std::string timestamp;
+    std::string parentId;
+    std::vector<std::pair<std::string, int>> files; // file name and version
+};
+
+std::vector<FileNode> stagedFiles;
+std::string lastCommitId = "";  // track latest commit
+
+// ---------------------- Utility Functions ----------------------
+
+bool directoryExists(const char* path) {
+    struct stat info;
+    if (stat(path, &info) != 0) return false;
+    return (info.st_mode & S_IFDIR) != 0;
 }
 
-std::string hash_to_string(unsigned long hash) {
+void saveHEAD(const std::string& commitId) {
+    std::ofstream out(".minigit/HEAD");
+    if (out) {
+        out << commitId;
+    } else {
+        std::cerr << "Error writing HEAD\n";
+    }
+}
+
+std::string loadHEAD() {
+    std::ifstream in(".minigit/HEAD");
+    std::string id;
+    if (in) {
+        std::getline(in, id);
+    }
+    return id;
+}
+
+void initializeMiniGit() {
+    if (!directoryExists(".minigit")) {
+        system("mkdir .minigit");
+        std::cout << "Created .minigit folder\n";
+    } else {
+        std::cout << ".minigit folder already exists\n";
+    }
+    lastCommitId = loadHEAD();  // load latest commit ID from HEAD file
+}
+
+void createFolders() {
+    if (!directoryExists(".minigit/objects")) {
+        system("mkdir .minigit/objects");
+        std::cout << "Created .minigit/objects folder\n";
+    }
+
+    if (!directoryExists(".minigit/commits")) {
+        system("mkdir .minigit/commits");
+        std::cout << "Created .minigit/commits folder\n";
+    }
+}
+
+std::string getCurrentTimestamp() {
+    std::time_t now = std::time(nullptr);
+    char buf[100];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", std::localtime(&now));
+    return buf;
+}
+
+std::string generateCommitId() {
     std::stringstream ss;
-    ss << std::hex << std::setw(16) << std::setfill('0') << hash;
+    ss << std::time(nullptr);
     return ss.str();
 }
 
-std::string get_current_timestamp() {
-    auto now = std::time(nullptr);
-    std::stringstream ss;
-    ss << std::put_time(std::localtime(&now), "%Y-%m-%dT%H:%M:%S");
-    return ss.str();
+bool copyFile(const std::string& src, const std::string& dest) {
+    std::ifstream in(src.c_str(), std::ios::binary);
+    if (!in) {
+        std::cerr << "Error: Cannot open source file: " << src << "\n";
+        return false;
+    }
+    std::ofstream out(dest.c_str(), std::ios::binary);
+    if (!out) {
+        std::cerr << "Error: Cannot create destination file: " << dest << "\n";
+        return false;
+    }
+    out << in.rdbuf();
+    return true;
 }
 
-std::string serialize_commit(const Commit& commit) {
-    std::stringstream ss;
-    for (const auto& parent : commit.parents) {
-        ss << "parent " << parent << "\n";
-    }
-    ss << "timestamp " << commit.timestamp << "\n";
-    ss << "message " << commit.message << "\n";
-    for (const auto& pair : commit.files) {
-        ss << pair.first << ":" << pair.second << "\n";
-    }
-    return ss.str();
-}
+// ---------------------- Core MiniGit Features ----------------------
 
-Commit load_commit(const std::string& commit_hash) {
-    std::string commit_path = ".minigit/objects/" + commit_hash;
-    std::ifstream commit_file(commit_path);
-    Commit commit;
-    std::string line;
-    while (std::getline(commit_file, line)) {
-        if (line.substr(0, 7) == "parent ") {
-            commit.parents.push_back(line.substr(7));
-        } else if (line.substr(0, 10) == "timestamp ") {
-            commit.timestamp = line.substr(10);
-        } else if (line.substr(0, 8) == "message ") {
-            commit.message = line.substr(8);
-        } else {
-            size_t pos = line.find(':');
-            if (pos != std::string::npos) {
-                std::string fn = line.substr(0, pos);
-                std::string bh = line.substr(pos + 1);
-                commit.files[fn] = bh;
+void addFile() {
+    std::string name;
+    std::cout << "Enter filename to track (type 'done' to finish):\n";
+    while (true) {
+        std::cout << "> ";
+        std::getline(std::cin, name);
+        if (name == "done") break;
+
+        bool alreadyAdded = false;
+        for (const auto& f : stagedFiles) {
+            if (f.fileName == name) {
+                std::cout << "File already added.\n";
+                alreadyAdded = true;
+                break;
             }
         }
-    }
-    commit_file.close();
-    return commit;
-}
-
-void init() {
-    fs::create_directory(".minigit");
-    fs::create_directory(".minigit/objects");
-    fs::create_directory(".minigit/refs");
-    fs::create_directory(".minigit/refs/heads");
-    std::ofstream head_file(".minigit/HEAD");
-    head_file << "ref: refs/heads/master";
-    head_file.close();
-    std::ofstream master_file(".minigit/refs/heads/master");
-    master_file << "0000000000000000"; // special value for no commit
-    master_file.close();
-    std::ofstream index_file(".minigit/index");
-    index_file.close();
-    std::cout << "Initialized empty MiniGit repository in .minigit/" << std::endl;
-}
-
-void add(const std::string& filename) {
-    if (!fs::exists(filename)) {
-        std::cerr << "Error: File does not exist: " << filename << std::endl;
-        return;
-    }
-    std::ifstream file(filename, std::ios::binary);
-    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-    file.close();
-    unsigned long hash = custom_hash(content);
-    std::string hash_str = hash_to_string(hash);
-    std::string blob_path = ".minigit/objects/" + hash_str;
-    if (!fs::exists(blob_path)) {
-        std::ofstream blob_file(blob_path, std::ios::binary);
-        blob_file << content;
-        blob_file.close();
-    }
-    std::map<std::string, std::string> index;
-    std::ifstream index_file(".minigit/index");
-    std::string line;
-    while (std::getline(index_file, line)) {
-        size_t pos = line.find(':');
-        if (pos != std::string::npos) {
-            std::string fn = line.substr(0, pos);
-            std::string bh = line.substr(pos + 1);
-            index[fn] = bh;
+        if (!alreadyAdded) {
+            stagedFiles.push_back({name, 0});
+            std::cout << "Added: " << name << "\n";
         }
     }
-    index_file.close();
-    index[filename] = hash_str;
-    std::ofstream index_file_out(".minigit/index");
-    for (const auto& pair : index) {
-        index_file_out << pair.first << ":" << pair.second << "\n";
-    }
-    index_file_out.close();
-    std::cout << "Added " << filename << " to staging area." << std::endl;
 }
 
-void commit(const std::string& message) {
-    std::ifstream head_file(".minigit/HEAD");
-    std::string head_content;
-    std::getline(head_file, head_content);
-    head_file.close();
-    std::string current_branch;
-    if (head_content.substr(0, 5) == "ref: ") {
-        current_branch = head_content.substr(5);
-    } else {
-        std::cerr << "Error: Detached HEAD not supported." << std::endl;
+void saveCommitMetadata(const Commit& commit) {
+    std::string path = ".minigit/commits/" + commit.id + ".txt";
+    std::ofstream out(path);
+    if (!out) {
+        std::cerr << "Error: Failed to save commit metadata.\n";
         return;
     }
-    std::string branch_path = ".minigit/" + current_branch;
-    std::ifstream branch_file(branch_path);
-    std::string last_commit_hash;
-    std::getline(branch_file, last_commit_hash);
-    branch_file.close();
-    std::map<std::string, std::string> index;
-    std::ifstream index_file(".minigit/index");
-    std::string line;
-    while (std::getline(index_file, line)) {
-        size_t pos = line.find(':');
-        if (pos != std::string::npos) {
-            std::string fn = line.substr(0, pos);
-            std::string bh = line.substr(pos + 1);
-            index[fn] = bh;
+
+    out << "Commit ID: " << commit.id << "\n";
+    out << "Timestamp: " << commit.timestamp << "\n";
+    out << "Message: " << commit.message << "\n";
+    out << "Parent ID: " << commit.parentId << "\n";
+    out << "Files:\n";
+    for (const auto& file : commit.files) {
+        out << " - " << file.first << " (v" << file.second << ")\n";
+    }
+
+    std::cout << "Saved commit metadata to: " << path << "\n";
+}
+
+void commit() {
+    createFolders();
+
+    Commit newCommit;
+    newCommit.id = generateCommitId();
+    newCommit.timestamp = getCurrentTimestamp();
+    newCommit.parentId = lastCommitId;
+
+    std::cout << "Enter commit message:\n> ";
+    std::string message;
+    std::getline(std::cin, message);
+    newCommit.message = message;
+
+    for (auto& f : stagedFiles) {
+        std::string versionedName = f.fileName + "_" + std::to_string(f.versionCount);
+        std::string dest = ".minigit/objects/" + versionedName;
+
+        if (copyFile(f.fileName, dest)) {
+            std::cout << "Committed " << f.fileName << " as " << versionedName << "\n";
+            newCommit.files.push_back({f.fileName, f.versionCount});
+            f.versionCount++;  // version increases after commit
+        } else {
+            std::cout << "Failed to commit " << f.fileName << "\n";
         }
     }
-    index_file.close();
-    if (last_commit_hash == "0000000000000000") {
-        Commit new_commit;
-        new_commit.timestamp = get_current_timestamp();
-        new_commit.message = message;
-        new_commit.files = index;
-        std::string commit_content = serialize_commit(new_commit);
-        unsigned long commit_hash = custom_hash(commit_content);
-        std::string commit_hash_str = hash_to_string(commit_hash);
-        std::string commit_path = ".minigit/objects/" + commit_hash_str;
-        std::ofstream commit_file(commit_path);
-        commit_file << commit_content;
-        commit_file.close();
-        std::ofstream branch_file_out(branch_path);
-        branch_file_out << commit_hash_str;
-        branch_file_out.close();
-        std::cout << "Committed as " << commit_hash_str << std::endl;
-    } else {
-        Commit last_commit = load_commit(last_commit_hash);
-        if (last_commit.files == index) {
-            std::cout << "No changes to commit." << std::endl;
+
+    saveCommitMetadata(newCommit);
+    lastCommitId = newCommit.id;
+    saveHEAD(newCommit.id);  // update HEAD with latest commit
+}
+// --- addSingleFile -------------------------------------------------
+void addSingleFile(const std::string& name)
+{
+    for (const auto& f : stagedFiles)
+        if (f.fileName == name) {
+            std::cout << "Already staged.\n";
             return;
         }
-        Commit new_commit;
-        new_commit.parents.push_back(last_commit_hash);
-        new_commit.timestamp = get_current_timestamp();
-        new_commit.message = message;
-        new_commit.files = index;
-        std::string commit_content = serialize_commit(new_commit);
-        unsigned long commit_hash = custom_hash(commit_content);
-        std::string commit_hash_str = hash_to_string(commit_hash);
-        std::string commit_path = ".minigit/objects/" + commit_hash_str;
-        std::ofstream commit_file(commit_path);
-        commit_file << commit_content;
-        commit_file.close();
-        std::ofstream branch_file_out(branch_path);
-        branch_file_out << commit_hash_str;
-        branch_file_out.close();
-        std::cout << "Committed as " << commit_hash_str << std::endl;
-    }
+    stagedFiles.push_back({name, 0});
+    std::cout << "Staged " << name << "\n";
 }
 
-void log() {
-    std::ifstream head_file(".minigit/HEAD");
-    std::string head_content;
-    std::getline(head_file, head_content);
-    head_file.close();
-    std::string current_branch;
-    if (head_content.substr(0, 5) == "ref: ") {
-        current_branch = head_content.substr(5);
-    } else {
-        std::cerr << "Error: Detached HEAD not supported." << std::endl;
-        return;
-    }
-    std::string branch_path = ".minigit/" + current_branch;
-    std::ifstream branch_file(branch_path);
-    std::string commit_hash;
-    std::getline(branch_file, commit_hash);
-    branch_file.close();
-    if (commit_hash == "0000000000000000") {
-        std::cout << "No commits yet." << std::endl;
-        return;
-    }
-    while (true) {
-        Commit commit = load_commit(commit_hash);
-        std::cout << "Commit " << commit_hash << "\n";
-        std::cout << "Date: " << commit.timestamp << "\n";
-        std::cout << commit.message << "\n\n";
-        if (commit.parents.empty()) {
-            break;
-        }
-        commit_hash = commit.parents[0];
-    }
-}
+// --- commit (overload takes message) -------------------------------
+void commit(const std::string& message)
+{
+    createFolders();
 
-void branch(const std::string& branch_name) {
-    std::ifstream head_file(".minigit/HEAD");
-    std::string head_content;
-    std::getline(head_file, head_content);
-    head_file.close();
-    std::string current_branch;
-    if (head_content.substr(0, 5) == "ref: ") {
-        current_branch = head_content.substr(5);
-    } else {
-        std::cerr << "Error: Detached HEAD not supported." << std::endl;
-        return;
-    }
-    std::string branch_path = ".minigit/" + current_branch;
-    std::ifstream branch_file(branch_path);
-    std::string commit_hash;
-    std::getline(branch_file, commit_hash);
-    branch_file.close();
-    if (commit_hash == "0000000000000000") {
-        std::cerr << "Error: No commits yet. Cannot create branch." << std::endl;
-        return;
-    }
-    std::string new_branch_path = ".minigit/refs/heads/" + branch_name;
-    if (fs::exists(new_branch_path)) {
-        std::cerr << "Error: Branch already exists." << std::endl;
-        return;
-    }
-    std::ofstream new_branch_file(new_branch_path);
-    new_branch_file << commit_hash;
-    new_branch_file.close();
-    std::cout << "Created branch " << branch_name << std::endl;
-}
+    Commit newCommit;
+    newCommit.id        = generateCommitId();
+    newCommit.timestamp = getCurrentTimestamp();
+    newCommit.parentId  = lastCommitId;
+    newCommit.message   = message;
 
-void checkout(const std::string& target) {
-    std::string commit_hash;
-    if (fs::exists(".minigit/refs/heads/" + target)) {
-        std::ifstream branch_file(".minigit/refs/heads/" + target);
-        std::getline(branch_file, commit_hash);
-        branch_file.close();
-        std::ofstream head_file(".minigit/HEAD");
-        head_file << "ref: refs/heads/" << target;
-        head_file.close();
-    } else {
-        commit_hash = target;
-        if (!fs::exists(".minigit/objects/" + commit_hash)) {
-            std::cerr << "Error: Commit hash does not exist." << std::endl;
-            return;
-        }
-        std::ofstream head_file(".minigit/HEAD");
-        head_file << commit_hash;
-        head_file.close();
-    }
-    Commit commit = load_commit(commit_hash);
-    for (const auto& entry : fs::directory_iterator(".")) {
-        if (entry.path().filename() != ".minigit") {
-            fs::remove_all(entry.path());
+    for (auto& f : stagedFiles) {
+        std::string versionedName = f.fileName + "_" + std::to_string(f.versionCount);
+        std::string dest = ".minigit/objects/" + versionedName;
+
+        if (copyFile(f.fileName, dest)) {
+            newCommit.files.push_back({f.fileName, f.versionCount});
+            f.versionCount++;
         }
     }
-    for (const auto& pair : commit.files) {
-        std::string filename = pair.first;
-        std::string blob_hash = pair.second;
-        std::string blob_path = ".minigit/objects/" + blob_hash;
-        std::ifstream blob_file(blob_path, std::ios::binary);
-        std::string content((std::istreambuf_iterator<char>(blob_file)), std::istreambuf_iterator<char>());
-        blob_file.close();
-        std::ofstream file(filename, std::ios::binary);
-        file << content;
-        file.close();
-    }
-    std::ofstream index_file(".minigit/index");
-    for (const auto& pair : commit.files) {
-        index_file << pair.first << ":" << pair.second << "\n";
-    }
-    index_file.close();
-    std::cout << "Checked out to " << target << std::endl;
+
+    saveCommitMetadata(newCommit);
+    lastCommitId = newCommit.id;
+    saveHEAD(newCommit.id);
+    std::cout << "Committed as " << newCommit.id << "\n";
 }
 
-int main(int argc, char* argv[]) {
+// --- logHistory ----------------------------------------------------
+void logHistory()
+{
+    std::string id = loadHEAD();
+    if (id.empty()) { std::cout << "No commits yet.\n"; return; }
+
+    while (!id.empty()) {
+        std::ifstream in(".minigit/commits/" + id + ".txt");
+        if (!in) { std::cerr << "Missing commit file for " << id << "\n"; break; }
+
+        std::string line;
+        std::string parent;
+        while (std::getline(in, line)) {
+            std::cout << line << '\n';
+            if (line.rfind("Parent ID:", 0) == 0)
+                parent = line.substr(11);          // crude parse
+        }
+        std::cout << "--------------------------\n";
+        id = (parent == "" || parent == " ") ? "" : parent;
+    }
+}
+
+// ---------------------- Main Program ----------------------
+
+int main(int argc, char* argv[])
+{
     if (argc < 2) {
-        std::cerr << "Usage: minigit <command> [<args>]\n";
-        return 1;
+        std::cout << "MiniGit commands: init | add <file> | commit -m \"msg\" | log\n";
+        return 0;
     }
-    std::string command = argv[1];
-    if (command == "init") {
-        init();
-    } else if (command == "add") {
-        if (argc < 3) {
-            std::cerr << "Usage: minigit add <filename>\n";
-            return 1;
+
+    std::string cmd = argv[1];
+
+    if (cmd == "init") {
+        initializeMiniGit();
+        std::cout << "Repository initialised.\n";
+        return 0;
+    }
+
+    // Every command below expects .minigit to exist
+    initializeMiniGit();
+
+    if (cmd == "add") {
+        if (argc < 3) { std::cerr << "add <filename>\n"; return 1; }
+        addSingleFile(argv[2]);            // new helper, see next block
+    }
+    else if (cmd == "commit") {
+        if (argc >= 4 && std::string(argv[2]) == "-m") {
+            commit(argv[3]);               // commit now takes message as param
+        } else {
+            std::cerr << "commit -m \"message\"\n"; return 1;
         }
-        add(argv[2]);
-    } else if (command == "commit") {
-        if (argc < 4 || std::string(argv[2]) != "-m") {
-            std::cerr << "Usage: minigit commit -m <message>\n";
-            return 1;
-        }
-        commit(argv[3]);
-    } else if (command == "log") {
-        log();
-    } else if (command == "branch") {
-        if (argc < 3) {
-            std::cerr << "Usage: minigit branch <branch-name>\n";
-            return 1;
-        }
-        branch(argv[2]);
-    } else if (command == "checkout") {
-        if (argc < 3) {
-            std::cerr << "Usage: minigit checkout <branch-name> or <commit-hash>\n";
-            return 1;
-        }
-        checkout(argv[2]);
-    } else {
-        std::cerr << "Unknown command: " << command << "\n";
+    }
+    else if (cmd == "log") {
+        logHistory();                      // brand‑new function, coming up
+    }
+    else {
+        std::cerr << "Unknown command.\n";
         return 1;
     }
     return 0;

@@ -352,6 +352,85 @@ void checkout(const std::string& target) {
 
     std::cout << "Checked out to " << target << std::endl;
 }
+void merge(const std::string& branch_name) {
+    std::string target_branch_path = ".minigit/refs/heads/" + branch_name;
+    if (!fs::exists(target_branch_path)) {
+        std::cerr << "Error: Branch does not exist." << std::endl;
+        return;
+    }
+
+    // Load HEAD
+    std::ifstream head_file(".minigit/HEAD");
+    std::string head_ref;
+    std::getline(head_file, head_ref);
+    head_file.close();
+
+    if (head_ref.substr(0, 5) != "ref: ") {
+        std::cerr << "Error: Detached HEAD not supported for merge." << std::endl;
+        return;
+    }
+
+    std::string current_branch = head_ref.substr(5);
+    std::string current_branch_path = ".minigit/" + current_branch;
+
+    std::ifstream current_branch_file(current_branch_path);
+    std::string current_commit_hash;
+    std::getline(current_branch_file, current_commit_hash);
+    current_branch_file.close();
+
+    std::ifstream target_branch_file(target_branch_path);
+    std::string target_commit_hash;
+    std::getline(target_branch_file, target_commit_hash);
+    target_branch_file.close();
+
+    if (current_commit_hash == "0000000000000000" || target_commit_hash == "0000000000000000") {
+        std::cerr << "Error: Both branches must have at least one commit." << std::endl;
+        return;
+    }
+
+    Commit current_commit = load_commit(current_commit_hash);
+    Commit target_commit = load_commit(target_commit_hash);
+
+    // Merge file maps: prefer target's changes in case of conflict
+    std::map<std::string, std::string> merged_files = current_commit.files;
+
+    for (const auto& [file, blob_hash] : target_commit.files) {
+        if (merged_files.find(file) == merged_files.end()) {
+            merged_files[file] = blob_hash;
+        } else if (merged_files[file] != blob_hash) {
+            // Conflict – for now, take target’s version
+            merged_files[file] = blob_hash;
+            std::cout << "Conflict in file: " << file << " — using version from " << branch_name << std::endl;
+        }
+    }
+
+    // Create merge commit
+    Commit merge_commit;
+    merge_commit.timestamp = get_current_timestamp();
+    merge_commit.message = "Merged branch " + branch_name + " into " + current_branch.substr(12); // remove 'refs/heads/'
+    merge_commit.files = merged_files;
+    merge_commit.parents = { current_commit_hash, target_commit_hash };
+
+    std::string merge_content = serialize_commit(merge_commit);
+    std::string merge_hash = hash_to_string(custom_hash(merge_content));
+    std::ofstream merge_file(".minigit/objects/" + merge_hash);
+    merge_file << merge_content;
+    merge_file.close();
+
+    // Update current branch pointer
+    std::ofstream current_branch_out(current_branch_path);
+    current_branch_out << merge_hash;
+    current_branch_out.close();
+
+    // Update index
+    std::ofstream index_file(".minigit/index");
+    for (const auto& [file, blob_hash] : merged_files) {
+        index_file << file << ":" << blob_hash << "\n";
+    }
+    index_file.close();
+
+    std::cout << "Merged " << branch_name << " into " << current_branch.substr(12) << " as " << merge_hash << std::endl;
+}
 
 // Entry point and command parser
 int main(int argc, char* argv[]) {
@@ -370,11 +449,16 @@ int main(int argc, char* argv[]) {
         }
         add(argv[2]);
     } else if (command == "commit") {
-        if (argc < 4 || std::string(argv[2]) != "-m") {
-            std::cerr << "Usage: minigit commit -m <message>\n";
+        if (argc < 3) {
+            std::cerr << "Usage: minigit commit <message>\n";
             return 1;
         }
-        commit(argv[3]);
+        std::string message = argv[2];
+        for (int i = 3; i < argc; ++i) {
+            message += " ";
+            message += argv[i];
+        }
+        commit(message);
     } else if (command == "log") {
         log();
     } else if (command == "branch") {
@@ -385,13 +469,21 @@ int main(int argc, char* argv[]) {
         branch(argv[2]);
     } else if (command == "checkout") {
         if (argc < 3) {
-            std::cerr << "Usage: minigit checkout <branch_or_commit_hash>\n";
+            std::cerr << "Usage: minigit checkout <branch_name|commit_hash>\n";
             return 1;
         }
         checkout(argv[2]);
+    } else if (command == "merge") {
+        if (argc < 3) {
+            std::cerr << "Usage: minigit merge <branch_name>\n";
+            return 1;
+        }
+        merge(argv[2]);
     } else {
         std::cerr << "Unknown command: " << command << "\n";
+        std::cerr << "Available commands: init, add, commit, log, branch, checkout, merge\n";
         return 1;
     }
+
     return 0;
 }
