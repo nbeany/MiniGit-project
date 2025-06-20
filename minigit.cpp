@@ -1,0 +1,484 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include <map>
+#include <set>
+#include <algorithm>
+#include <filesystem>
+#include <ctime>
+#include <iomanip>
+
+namespace fs = std::filesystem;
+
+std::set<std::string> collectAncestors(const std::string& commitHash);
+void merge(const std::string& otherBranch);
+
+
+struct Commit {
+    std::vector<std::string> parents;
+    std::string timestamp;
+    std::string message;
+    std::map<std::string, std::string> files; // filename to blob_hash
+};
+
+unsigned long custom_hash(const std::string& str) {
+    unsigned long hash = 5381;
+    for (char c : str) {
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+    }
+    return hash;
+}
+
+std::string hash_to_string(unsigned long hash) {
+    std::stringstream ss;
+    ss << std::hex << std::setw(16) << std::setfill('0') << hash;
+    return ss.str();
+}
+
+std::string get_current_timestamp() {
+    auto now = std::time(nullptr);
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&now), "%Y-%m-%dT%H:%M:%S");
+    return ss.str();
+}
+
+std::string serialize_commit(const Commit& commit) {
+    std::stringstream ss;
+    for (const auto& parent : commit.parents) {
+        ss << "parent " << parent << "\n";
+    }
+    ss << "timestamp " << commit.timestamp << "\n";
+    ss << "message " << commit.message << "\n";
+    for (const auto& pair : commit.files) {
+        ss << pair.first << ":" << pair.second << "\n";
+    }
+    return ss.str();
+}
+
+Commit load_commit(const std::string& commit_hash) {
+    std::string commit_path = ".minigit/objects/" + commit_hash;
+    std::ifstream commit_file(commit_path);
+    Commit commit;
+    std::string line;
+    while (std::getline(commit_file, line)) {
+        if (line.substr(0, 7) == "parent ") {
+            commit.parents.push_back(line.substr(7));
+        } else if (line.substr(0, 10) == "timestamp ") {
+            commit.timestamp = line.substr(10);
+        } else if (line.substr(0, 8) == "message ") {
+            commit.message = line.substr(8);
+        } else {
+            size_t pos = line.find(':');
+            if (pos != std::string::npos) {
+                std::string fn = line.substr(0, pos);
+                std::string bh = line.substr(pos + 1);
+                commit.files[fn] = bh;
+            }
+        }
+    }
+    commit_file.close();
+    return commit;
+}
+
+std::set<std::string> collectAncestors(const std::string& commitHash) {
+    std::set<std::string> visited;
+    std::vector<std::string> stack = {commitHash};
+
+    while (!stack.empty()) {
+        std::string current = stack.back();
+        stack.pop_back();
+        if (visited.count(current)) continue;
+
+        visited.insert(current);
+        Commit c = load_commit(current);
+        for (const std::string& p : c.parents) {
+            stack.push_back(p);
+        }
+    }
+    return visited;
+}
+
+
+void init() {
+    fs::create_directory(".minigit");
+    fs::create_directory(".minigit/objects");
+    fs::create_directory(".minigit/refs");
+    fs::create_directory(".minigit/refs/heads");
+    std::ofstream head_file(".minigit/HEAD");
+    head_file << "ref: refs/heads/master";
+    head_file.close();
+    std::ofstream master_file(".minigit/refs/heads/master");
+    master_file << "0000000000000000"; // special value for no commit
+    master_file.close();
+    std::ofstream index_file(".minigit/index");
+    index_file.close();
+    std::cout << "Initialized empty MiniGit repository in .minigit/" << std::endl;
+}
+
+void add(const std::string& filename) {
+    if (!fs::exists(filename)) {
+        std::cerr << "Error: File does not exist: " << filename << std::endl;
+        return;
+    }
+    std::ifstream file(filename, std::ios::binary);
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+    unsigned long hash = custom_hash(content);
+    std::string hash_str = hash_to_string(hash);
+    std::string blob_path = ".minigit/objects/" + hash_str;
+    if (!fs::exists(blob_path)) {
+        std::ofstream blob_file(blob_path, std::ios::binary);
+        blob_file << content;
+        blob_file.close();
+    }
+    std::map<std::string, std::string> index;
+    std::ifstream index_file(".minigit/index");
+    std::string line;
+    while (std::getline(index_file, line)) {
+        size_t pos = line.find(':');
+        if (pos != std::string::npos) {
+            std::string fn = line.substr(0, pos);
+            std::string bh = line.substr(pos + 1);
+            index[fn] = bh;
+        }
+    }
+    index_file.close();
+    index[filename] = hash_str;
+    std::ofstream index_file_out(".minigit/index");
+    for (const auto& pair : index) {
+        index_file_out << pair.first << ":" << pair.second << "\n";
+    }
+    index_file_out.close();
+    std::cout << "Added " << filename << " to staging area." << std::endl;
+}
+
+void commit(const std::string& message) {
+    std::ifstream head_file(".minigit/HEAD");
+    std::string head_content;
+    std::getline(head_file, head_content);
+    head_file.close();
+    std::string current_branch;
+    if (head_content.substr(0, 5) == "ref: ") {
+        current_branch = head_content.substr(5);
+    } else {
+        std::cerr << "Error: Detached HEAD not supported." << std::endl;
+        return;
+    }
+    std::string branch_path = ".minigit/" + current_branch;
+    std::ifstream branch_file(branch_path);
+    std::string last_commit_hash;
+    std::getline(branch_file, last_commit_hash);
+    branch_file.close();
+    std::map<std::string, std::string> index;
+    std::ifstream index_file(".minigit/index");
+    std::string line;
+    while (std::getline(index_file, line)) {
+        size_t pos = line.find(':');
+        if (pos != std::string::npos) {
+            std::string fn = line.substr(0, pos);
+            std::string bh = line.substr(pos + 1);
+            index[fn] = bh;
+        }
+    }
+    index_file.close();
+    if (last_commit_hash == "0000000000000000") {
+        Commit new_commit;
+        new_commit.timestamp = get_current_timestamp();
+        new_commit.message = message;
+        new_commit.files = index;
+        std::string commit_content = serialize_commit(new_commit);
+        unsigned long commit_hash = custom_hash(commit_content);
+        std::string commit_hash_str = hash_to_string(commit_hash);
+        std::string commit_path = ".minigit/objects/" + commit_hash_str;
+        std::ofstream commit_file(commit_path);
+        commit_file << commit_content;
+        commit_file.close();
+        std::ofstream branch_file_out(branch_path);
+        branch_file_out << commit_hash_str;
+        branch_file_out.close();
+        std::cout << "Committed as " << commit_hash_str << std::endl;
+    } else {
+        Commit last_commit = load_commit(last_commit_hash);
+        if (last_commit.files == index) {
+            std::cout << "No changes to commit." << std::endl;
+            return;
+        }
+        Commit new_commit;
+        new_commit.parents.push_back(last_commit_hash);
+        new_commit.timestamp = get_current_timestamp();
+        new_commit.message = message;
+        new_commit.files = index;
+        std::string commit_content = serialize_commit(new_commit);
+        unsigned long commit_hash = custom_hash(commit_content);
+        std::string commit_hash_str = hash_to_string(commit_hash);
+        std::string commit_path = ".minigit/objects/" + commit_hash_str;
+        std::ofstream commit_file(commit_path);
+        commit_file << commit_content;
+        commit_file.close();
+        std::ofstream branch_file_out(branch_path);
+        branch_file_out << commit_hash_str;
+        branch_file_out.close();
+        std::cout << "Committed as " << commit_hash_str << std::endl;
+    }
+}
+
+void merge(const std::string& otherBranch) {
+    std::string otherPath = ".minigit/refs/heads/" + otherBranch;
+    if (!fs::exists(otherPath)) {
+        std::cerr << "Error: Branch does not exist.\n";
+        return;
+    }
+
+    std::ifstream headFile(".minigit/HEAD");
+    std::string ref;
+    std::getline(headFile, ref);
+    headFile.close();
+
+    if (ref.substr(0, 5) != "ref: ") {
+        std::cerr << "Detached HEAD not supported.\n";
+        return;
+    }
+
+    std::string currBranch = ref.substr(5);
+    std::ifstream currFile(".minigit/" + currBranch);
+    std::ifstream otherFile(otherPath);
+    std::string currHash, otherHash;
+    std::getline(currFile, currHash);
+    std::getline(otherFile, otherHash);
+    currFile.close(); otherFile.close();
+
+    std::set<std::string> currAncestors = collectAncestors(currHash);
+    std::set<std::string> otherAncestors = collectAncestors(otherHash);
+
+    std::string LCA;
+    for (const std::string& c : currAncestors) {
+        if (otherAncestors.count(c)) {
+            LCA = c;
+            break;
+        }
+    }
+
+    if (LCA.empty()) {
+        std::cerr << "No common ancestor found.\n";
+        return;
+    }
+
+    Commit base = load_commit(LCA);
+    Commit current = load_commit(currHash);
+    Commit other = load_commit(otherHash);
+
+    std::set<std::string> allFiles;
+    for (const auto& p : base.files) allFiles.insert(p.first);
+    for (const auto& p : current.files) allFiles.insert(p.first);
+    for (const auto& p : other.files) allFiles.insert(p.first);
+
+    bool conflict = false;
+    std::map<std::string, std::string> mergedFiles;
+
+    for (const std::string& file : allFiles) {
+        std::string baseVal = base.files[file];
+        std::string currVal = current.files[file];
+        std::string otherVal = other.files[file];
+
+        if (currVal == otherVal) {
+            mergedFiles[file] = currVal;
+        }
+        else if (baseVal == currVal) {
+            mergedFiles[file] = otherVal;
+        }
+        else if (baseVal == otherVal) {
+            mergedFiles[file] = currVal;
+        }
+        else {
+            std::cout << "CONFLICT: both modified " << file << "\n";
+            conflict = true;
+        }
+    }
+
+    if (conflict) {
+        std::cout << "Please resolve conflicts manually and commit.\n";
+        return;
+    }
+
+    Commit mergeCommit;
+    mergeCommit.parents = {currHash, otherHash};
+    mergeCommit.timestamp = get_current_timestamp();
+    mergeCommit.message = "Merged branch " + otherBranch;
+    mergeCommit.files = mergedFiles;
+
+    std::string content = serialize_commit(mergeCommit);
+    std::string hashStr = hash_to_string(custom_hash(content));
+
+    std::ofstream out(".minigit/objects/" + hashStr);
+    out << content;
+    out.close();
+
+    std::ofstream update(".minigit/" + currBranch);
+    update << hashStr;
+    update.close();
+
+    std::cout << "Merged into " << currBranch << " as " << hashStr << "\n";
+}
+
+
+void log() {
+    std::ifstream head_file(".minigit/HEAD");
+    std::string head_content;
+    std::getline(head_file, head_content);
+    head_file.close();
+    std::string current_branch;
+    if (head_content.substr(0, 5) == "ref: ") {
+        current_branch = head_content.substr(5);
+    } else {
+        std::cerr << "Error: Detached HEAD not supported." << std::endl;
+        return;
+    }
+    std::string branch_path = ".minigit/" + current_branch;
+    std::ifstream branch_file(branch_path);
+    std::string commit_hash;
+    std::getline(branch_file, commit_hash);
+    branch_file.close();
+    if (commit_hash == "0000000000000000") {
+        std::cout << "No commits yet." << std::endl;
+        return;
+    }
+    while (true) {
+        Commit commit = load_commit(commit_hash);
+        std::cout << "Commit " << commit_hash << "\n";
+        std::cout << "Date: " << commit.timestamp << "\n";
+        std::cout << commit.message << "\n\n";
+        if (commit.parents.empty()) {
+            break;
+        }
+        commit_hash = commit.parents[0];
+    }
+}
+
+void branch(const std::string& branch_name) {
+    std::ifstream head_file(".minigit/HEAD");
+    std::string head_content;
+    std::getline(head_file, head_content);
+    head_file.close();
+    std::string current_branch;
+    if (head_content.substr(0, 5) == "ref: ") {
+        current_branch = head_content.substr(5);
+    } else {
+        std::cerr << "Error: Detached HEAD not supported." << std::endl;
+        return;
+    }
+    std::string branch_path = ".minigit/" + current_branch;
+    std::ifstream branch_file(branch_path);
+    std::string commit_hash;
+    std::getline(branch_file, commit_hash);
+    branch_file.close();
+    if (commit_hash == "0000000000000000") {
+        std::cerr << "Error: No commits yet. Cannot create branch." << std::endl;
+        return;
+    }
+    std::string new_branch_path = ".minigit/refs/heads/" + branch_name;
+    if (fs::exists(new_branch_path)) {
+        std::cerr << "Error: Branch already exists." << std::endl;
+        return;
+    }
+    std::ofstream new_branch_file(new_branch_path);
+    new_branch_file << commit_hash;
+    new_branch_file.close();
+    std::cout << "Created branch " << branch_name << std::endl;
+}
+
+void checkout(const std::string& target) {
+    std::string commit_hash;
+    if (fs::exists(".minigit/refs/heads/" + target)) {
+        std::ifstream branch_file(".minigit/refs/heads/" + target);
+        std::getline(branch_file, commit_hash);
+        branch_file.close();
+        std::ofstream head_file(".minigit/HEAD");
+        head_file << "ref: refs/heads/" << target;
+        head_file.close();
+    } else {
+        commit_hash = target;
+        if (!fs::exists(".minigit/objects/" + commit_hash)) {
+            std::cerr << "Error: Commit hash does not exist." << std::endl;
+            return;
+        }
+        std::ofstream head_file(".minigit/HEAD");
+        head_file << commit_hash;
+        head_file.close();
+    }
+    Commit commit = load_commit(commit_hash);
+    for (const auto& entry : fs::directory_iterator(".")) {
+        if (entry.path().filename() != ".minigit") {
+            fs::remove_all(entry.path());
+        }
+    }
+    for (const auto& pair : commit.files) {
+        std::string filename = pair.first;
+        std::string blob_hash = pair.second;
+        std::string blob_path = ".minigit/objects/" + blob_hash;
+        std::ifstream blob_file(blob_path, std::ios::binary);
+        std::string content((std::istreambuf_iterator<char>(blob_file)), std::istreambuf_iterator<char>());
+        blob_file.close();
+        std::ofstream file(filename, std::ios::binary);
+        file << content;
+        file.close();
+    }
+    std::ofstream index_file(".minigit/index");
+    for (const auto& pair : commit.files) {
+        index_file << pair.first << ":" << pair.second << "\n";
+    }
+    index_file.close();
+    std::cout << "Checked out to " << target << std::endl;
+}
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: minigit <command> [<args>]\n";
+        return 1;
+    }
+    std::string command = argv[1];
+    if (command == "init") {
+        init();
+    } else if (command == "add") {
+        if (argc < 3) {
+            std::cerr << "Usage: minigit add <filename>\n";
+            return 1;
+        }
+        add(argv[2]);
+    } else if (command == "commit") {
+        if (argc < 4 || std::string(argv[2]) != "-m") {
+            std::cerr << "Usage: minigit commit -m <message>\n";
+            return 1;
+        }
+        commit(argv[3]);
+    } 
+    else if (command == "merge") {
+        if (argc < 3) {
+            std::cerr << "Usage: minigit merge <branch-name>\n";
+            return 1;
+        }
+        merge(argv[2]);
+    } 
+    else if (command == "log") {
+        log();
+    } else if (command == "branch") {
+        if (argc < 3) {
+            std::cerr << "Usage: minigit branch <branch-name>\n";
+            return 1;
+        }
+        branch(argv[2]);
+    } else if (command == "checkout") {
+        if (argc < 3) {
+            std::cerr << "Usage: minigit checkout <branch-name> or <commit-hash>\n";
+            return 1;
+        }
+        checkout(argv[2]);
+    } else {
+        std::cerr << "Unknown command: " << command << "\n";
+        return 1;
+    }
+    return 0;
+}
+
+
